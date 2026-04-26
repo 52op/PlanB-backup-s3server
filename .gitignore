@@ -1,0 +1,57 @@
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test / coverage / tool caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+s3server.log
+
+# Local runtime data
+s3data/
+
+# Test artifacts
+tests/.tmp/
+tests/output/
+tests/artifacts/
+
+# Local config overrides (keep example committed)
+config.local.ini
+*.ini

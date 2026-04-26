@@ -1,0 +1,15 @@
+[SERVER]
+host = 0.0.0.0
+port = 4431
+data_dir = ./s3data
+log_file = s3server.log
+
+[AUTH]
+access_key = s3admin
+secret_key = 12345678
+
+[SECURITY]
+require_sigv4 = true
+allow_v2 = false
+max_skew_seconds = 900
+allow_unsigned_payload = false

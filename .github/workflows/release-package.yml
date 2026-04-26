@@ -1,0 +1,160 @@
+name: Release Package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-binaries:
+    name: Build standalone binary (${{ matrix.os }} / ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows
+            arch: x64
+            runner: windows-latest
+            artifact_suffix: windows-x64
+            ext: .exe
+            archive: zip
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
+            artifact_suffix: linux-x64
+            ext: ""
+            archive: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate tag format
+        shell: bash
+        run: |
+          echo "GITHUB_REF_NAME=${GITHUB_REF_NAME}"
+          if ! echo "${GITHUB_REF_NAME}" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            echo "Invalid tag format. Expected: vMAJOR.MINOR.PATCH (optionally with suffix)."
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+
+      - name: Build standalone binary with PyInstaller
+        shell: bash
+        run: |
+          pyinstaller --clean --noconfirm --onefile --name py-s3server app.py
+
+      - name: Prepare release bundle (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist\bundle -Force | Out-Null
+          Copy-Item dist\py-s3server.exe dist\bundle\
+          Copy-Item config.ini.example dist\bundle\
+          if (Test-Path README.md) { Copy-Item README.md dist\bundle\ }
+          if (Test-Path tests\README.md) {
+            New-Item -ItemType Directory -Path dist\bundle\tests -Force | Out-Null
+            Copy-Item tests\README.md dist\bundle\tests\
+          }
+          if (Test-Path LICENSE) { Copy-Item LICENSE dist\bundle\ }
+
+      - name: Prepare release bundle (Linux)
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          mkdir -p dist/bundle
+          cp dist/py-s3server dist/bundle/
+          cp config.ini.example dist/bundle/
+          [ -f README.md ] && cp README.md dist/bundle/ || true
+          if [ -f tests/README.md ]; then
+            mkdir -p dist/bundle/tests
+            cp tests/README.md dist/bundle/tests/
+          fi
+          [ -f LICENSE ] && cp LICENSE dist/bundle/ || true
+          chmod +x dist/bundle/py-s3server
+
+      - name: Archive bundle (Windows zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $pkg = "py-s3server-${env:GITHUB_REF_NAME}-${{ matrix.artifact_suffix }}"
+          Compress-Archive -Path dist\bundle\* -DestinationPath "dist\$pkg.zip" -Force
+
+      - name: Archive bundle (Linux tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          pkg="py-s3server-${GITHUB_REF_NAME}-${{ matrix.artifact_suffix }}"
+          tar -C dist/bundle -czf "dist/${pkg}.tar.gz" .
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd dist
+          if ls *.zip >/dev/null 2>&1; then sha256sum *.zip > SHA256SUMS-${{ matrix.artifact_suffix }}.txt; fi
+          if ls *.tar.gz >/dev/null 2>&1; then sha256sum *.tar.gz > SHA256SUMS-${{ matrix.artifact_suffix }}.txt; fi
+          cat SHA256SUMS-${{ matrix.artifact_suffix }}.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.artifact_suffix }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/SHA256SUMS-${{ matrix.artifact_suffix }}.txt
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build-binaries
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Flatten release assets
+        shell: bash
+        run: |
+          mkdir -p dist
+          find release-assets -type f \( -name "*.zip" -o -name "*.tar.gz" -o -name "SHA256SUMS-*.txt" \) -exec cp {} dist/ \;
+          ls -lah dist
+
+      - name: Merge checksums
+        shell: bash
+        run: |
+          cd dist
+          cat SHA256SUMS-*.txt > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create / Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
