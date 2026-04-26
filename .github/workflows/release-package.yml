@@ -28,7 +28,7 @@ jobs:
             arch: x64
             runner: windows-latest
             python: "3.8"
-            artifact_suffix: windows-x64-win7
+            artifact_suffix: windows-x64
             binary_name: py-s3server.exe
             archive: zip
 

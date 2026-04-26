@@ -185,7 +185,7 @@ python tests/integration_smoke.py
 项目已配置 GitHub Actions：当你 push `v*` tag 时，会自动构建并发布多平台产物。
 
 ### 自动构建目标
-- Windows x64（Win7 兼容向）独立可执行文件（`.exe`）
+- Windows x64 独立可执行文件（`.exe`，兼容 Win7+）
 - Linux x64 独立可执行文件（ELF 可执行文件）
 
 > 独立二进制由 PyInstaller `--onefile` 构建，目标机器无需预装 Python。
@@ -204,7 +204,7 @@ python tests/integration_smoke.py
    - `README.md`
    - `LICENSE`（若存在））
 4. 输出归档文件：
-   - `py-s3server-vX.Y.Z-windows-x64-win7.zip`
+   - `py-s3server-vX.Y.Z-windows-x64.zip`
    - `py-s3server-vX.Y.Z-linux-x64.tar.gz`
 5. 生成校验文件 `SHA256SUMS.txt`
 6. 自动创建/更新 GitHub Release 并上传全部产物
@@ -237,7 +237,7 @@ v1.0.0-rc.1
 ```
 
 #### 发布后你会在 Release 中看到
-- `py-s3server-vX.Y.Z-windows-x64-win7.zip`
+- `py-s3server-vX.Y.Z-windows-x64.zip`
 - `py-s3server-vX.Y.Z-linux-x64.tar.gz`
 - `SHA256SUMS.txt`
 
