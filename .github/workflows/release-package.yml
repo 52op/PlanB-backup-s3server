@@ -20,17 +20,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Windows build: pin Python 3.8 for better Win7 compatibility
+          # Note: GitHub-hosted windows-latest runner itself is modern, so this is
+          # "best effort". If strict Win7 compatibility is required, build on a
+          # self-hosted Windows runner/toolchain that targets Win7.
           - os: windows
             arch: x64
             runner: windows-latest
-            artifact_suffix: windows-x64
-            ext: .exe
+            python: "3.8"
+            artifact_suffix: windows-x64-win7
+            binary_name: py-s3server.exe
             archive: zip
+
+          # Linux build
           - os: linux
             arch: x64
             runner: ubuntu-latest
+            python: "3.12"
             artifact_suffix: linux-x64
-            ext: ""
+            binary_name: py-s3server
             archive: tar.gz
 
     steps:
@@ -49,7 +57,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
 
       - name: Install build dependencies
         shell: bash
@@ -67,29 +75,21 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path dist\bundle -Force | Out-Null
-          Copy-Item dist\py-s3server.exe dist\bundle\
-          Copy-Item config.ini.example dist\bundle\
-          if (Test-Path README.md) { Copy-Item README.md dist\bundle\ }
-          if (Test-Path tests\README.md) {
-            New-Item -ItemType Directory -Path dist\bundle\tests -Force | Out-Null
-            Copy-Item tests\README.md dist\bundle\tests\
-          }
-          if (Test-Path LICENSE) { Copy-Item LICENSE dist\bundle\ }
+          Copy-Item "dist\${{ matrix.binary_name }}" "dist\bundle\"
+          Copy-Item config.ini.example "dist\bundle\"
+          if (Test-Path README.md) { Copy-Item README.md "dist\bundle\" }
+          if (Test-Path LICENSE) { Copy-Item LICENSE "dist\bundle\" }
 
       - name: Prepare release bundle (Linux)
         if: matrix.os == 'linux'
         shell: bash
         run: |
           mkdir -p dist/bundle
-          cp dist/py-s3server dist/bundle/
+          cp "dist/${{ matrix.binary_name }}" dist/bundle/
           cp config.ini.example dist/bundle/
           [ -f README.md ] && cp README.md dist/bundle/ || true
-          if [ -f tests/README.md ]; then
-            mkdir -p dist/bundle/tests
-            cp tests/README.md dist/bundle/tests/
-          fi
           [ -f LICENSE ] && cp LICENSE dist/bundle/ || true
-          chmod +x dist/bundle/py-s3server
+          chmod +x "dist/bundle/${{ matrix.binary_name }}"
 
       - name: Archive bundle (Windows zip)
         if: matrix.archive == 'zip'
@@ -109,9 +109,9 @@ jobs:
         shell: bash
         run: |
           cd dist
-          if ls *.zip >/dev/null 2>&1; then sha256sum *.zip > SHA256SUMS-${{ matrix.artifact_suffix }}.txt; fi
-          if ls *.tar.gz >/dev/null 2>&1; then sha256sum *.tar.gz > SHA256SUMS-${{ matrix.artifact_suffix }}.txt; fi
-          cat SHA256SUMS-${{ matrix.artifact_suffix }}.txt
+          if ls *.zip >/dev/null 2>&1; then sha256sum *.zip > "SHA256SUMS-${{ matrix.artifact_suffix }}.txt"; fi
+          if ls *.tar.gz >/dev/null 2>&1; then sha256sum *.tar.gz > "SHA256SUMS-${{ matrix.artifact_suffix }}.txt"; fi
+          cat "SHA256SUMS-${{ matrix.artifact_suffix }}.txt"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

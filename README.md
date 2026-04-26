@@ -185,7 +185,7 @@ python tests/integration_smoke.py
 项目已配置 GitHub Actions：当你 push `v*` tag 时，会自动构建并发布多平台产物。
 
 ### 自动构建目标
-- Windows x64 独立可执行文件（`.exe`）
+- Windows x64（Win7 兼容向）独立可执行文件（`.exe`）
 - Linux x64 独立可执行文件（ELF 可执行文件）
 
 > 独立二进制由 PyInstaller `--onefile` 构建，目标机器无需预装 Python。
@@ -202,10 +202,9 @@ python tests/integration_smoke.py
    - 二进制文件
    - `config.ini.example`
    - `README.md`
-   - `tests/README.md`
    - `LICENSE`（若存在））
 4. 输出归档文件：
-   - `py-s3server-vX.Y.Z-windows-x64.zip`
+   - `py-s3server-vX.Y.Z-windows-x64-win7.zip`
    - `py-s3server-vX.Y.Z-linux-x64.tar.gz`
 5. 生成校验文件 `SHA256SUMS.txt`
 6. 自动创建/更新 GitHub Release 并上传全部产物
@@ -238,9 +237,16 @@ v1.0.0-rc.1
 ```
 
 #### 发布后你会在 Release 中看到
-- `py-s3server-vX.Y.Z-windows-x64.zip`
+- `py-s3server-vX.Y.Z-windows-x64-win7.zip`
 - `py-s3server-vX.Y.Z-linux-x64.tar.gz`
 - `SHA256SUMS.txt`
+
+#### 发布包内容（精简）
+- 可执行文件（Windows 为 `.exe`，Linux 为无扩展名二进制）
+- `config.ini.example`
+- `README.md`
+- `LICENSE`（如果仓库中存在）
+- 不包含 `tests/` 目录与测试脚本
 
 ---
 
@@ -265,6 +271,25 @@ v1.0.0-rc.1
 
 ---
 
-## 📄 许可证
+## 📄 许可证（MIT，宽松授权）
 
-如需开源发布，建议补充 `LICENSE`（例如 MIT）。
+本项目采用 **MIT License**（最宽松、最常用的开源许可证之一）。
+
+你可以在满足 MIT 许可证声明保留要求的前提下，自由进行以下行为：
+
+- 商业使用
+- 修改源码
+- 再发布
+- 私有化使用
+- 与其他项目集成
+
+你需要履行的主要义务：
+
+- 在源码或发布包中保留原始版权声明与 MIT 许可文本
+
+责任与担保说明：
+
+- 本项目按“现状（AS IS）”提供，不提供任何明示或暗示担保
+- 作者/贡献者不对使用本项目产生的任何损失承担责任
+
+完整条款请查看仓库根目录下的 `LICENSE` 文件。
