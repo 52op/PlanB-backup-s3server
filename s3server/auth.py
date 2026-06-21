@@ -250,6 +250,127 @@ def verify_sigv4(
     return True, "ok"
 
 
+def parse_presigned_params(query: str) -> Optional[Dict[str, str]]:
+    """
+    Parse pre-signed URL parameters from query string.
+    Returns None if not a pre-signed request.
+    """
+    if "X-Amz-Signature" not in query and "x-amz-signature" not in query:
+        return None
+    params = urllib.parse.parse_qs(query, keep_blank_values=True)
+    sig = (params.get("X-Amz-Signature") or params.get("x-amz-signature") or [None])[0]
+    if not sig:
+        return None
+    algorithm = (params.get("X-Amz-Algorithm") or params.get("x-amz-algorithm") or [None])[0]
+    credential = (params.get("X-Amz-Credential") or params.get("x-amz-credential") or [None])[0]
+    amz_date = (params.get("X-Amz-Date") or params.get("x-amz-date") or [None])[0]
+    expires = (params.get("X-Amz-Expires") or params.get("x-amz-expires") or [None])[0]
+    signed_headers = (params.get("X-Amz-SignedHeaders") or params.get("x-amz-signedheaders") or [None])[0]
+    if not all([algorithm, credential, amz_date, signed_headers, sig]):
+        return None
+    if algorithm != "AWS4-HMAC-SHA256":
+        return None
+    cparts = credential.split("/")
+    if len(cparts) != 5:
+        return None
+    access_key, date_part, region, service, term = cparts
+    if term != "aws4_request":
+        return None
+    return {
+        "access_key": access_key,
+        "date": date_part,
+        "region": region,
+        "service": service,
+        "signed_headers": signed_headers,
+        "signature": sig.lower(),
+        "credential_scope": f"{date_part}/{region}/{service}/aws4_request",
+        "amz_date": amz_date,
+        "expires": expires,
+    }
+
+
+def build_canonical_query_from_params(raw_query: str, exclude_keys: set[str]) -> str:
+    """
+    Build a canonical query string from a raw query string,
+    excluding specified keys, with proper URI encoding.
+    """
+    params = urllib.parse.parse_qs(raw_query, keep_blank_values=True)
+    items = []
+    for k, values in params.items():
+        if k in exclude_keys:
+            continue
+        for v in values:
+            items.append((_uri_encode_preserving_pct(k, safe="-_.~"),
+                          _uri_encode_preserving_pct(v, safe="-_.~")))
+    items.sort(key=lambda x: (x[0], x[1]))
+    return "&".join([f"{k}={v}" for k, v in items])
+
+
+def verify_presigned_url(
+    handler,
+    pre_signed: Dict[str, str],
+    secret_key: str,
+    max_skew_seconds: int = 900,
+) -> Tuple[bool, str]:
+    method = handler.command.upper()
+    parsed_url = urllib.parse.urlsplit(handler.path)
+
+    expires_str = pre_signed["expires"]
+    try:
+        expires = int(expires_str)
+    except (ValueError, TypeError):
+        return False, "invalid X-Amz-Expires"
+    if expires < 0 or expires > 604800:
+        return False, "X-Amz-Expires must be between 0 and 604800"
+
+    time_ok, time_reason = check_time_skew(pre_signed["amz_date"], max_skew_seconds)
+    if not time_ok:
+        return False, time_reason
+
+    can_qs = build_canonical_query_from_params(
+        parsed_url.query or "", {"x-amz-signature", "X-Amz-Signature"}
+    )
+    can_uri = canonical_uri(parsed_url.path or "/")
+    can_headers, normalized_signed_headers = build_canonical_headers(
+        handler.headers, pre_signed["signed_headers"]
+    )
+
+    payload_hash = "UNSIGNED-PAYLOAD"
+    canonical_request = (
+        f"{method}\n"
+        f"{can_uri}\n"
+        f"{can_qs}\n"
+        f"{can_headers}\n"
+        f"{normalized_signed_headers}\n"
+        f"{payload_hash}"
+    )
+    canonical_request_hash = sha256_hex(canonical_request.encode("utf-8"))
+
+    string_to_sign = (
+        "AWS4-HMAC-SHA256\n"
+        f"{pre_signed['amz_date']}\n"
+        f"{pre_signed['credential_scope']}\n"
+        f"{canonical_request_hash}"
+    )
+
+    signing_key = derive_signing_key(
+        secret_key=secret_key,
+        date_part=pre_signed["date"],
+        region=pre_signed["region"],
+        service=pre_signed["service"],
+    )
+    expected = hmac.new(
+        signing_key,
+        string_to_sign.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected, pre_signed["signature"]):
+        return False, "signature mismatch (pre-signed)"
+
+    return True, "ok(pre-signed)"
+
+
 def check_auth(
     handler,
     access_key: str = "",
@@ -272,7 +393,23 @@ def check_auth(
     req_auth_type = auth_type_from_header(auth)
 
     if not auth:
-        return AuthResult(False, req_auth_type, "", "missing Authorization")
+        # Check for pre-signed URL (V4 signature in query params)
+        parsed_url = urllib.parse.urlsplit(handler.path)
+        pre_signed = parse_presigned_params(parsed_url.query or "")
+        if pre_signed:
+            ak = pre_signed["access_key"]
+            if ak != access_key:
+                return AuthResult(False, "V4-PRESIGNED", ak, "access key mismatch")
+            ok, reason = verify_presigned_url(
+                handler=handler,
+                pre_signed=pre_signed,
+                secret_key=secret_key,
+                max_skew_seconds=max_skew_seconds,
+            )
+            return AuthResult(ok, "V4-PRESIGNED", ak, reason)
+        if require_sigv4:
+            return AuthResult(False, req_auth_type, "", "missing Authorization")
+        return AuthResult(False, "NONE", "", "no auth")
 
     # SigV4 full verification
     if auth.startswith("AWS4-HMAC-SHA256"):

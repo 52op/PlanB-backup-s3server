@@ -158,3 +158,16 @@ def send_invalid_bucket_name(
         message=message,
         request_id=request_id,
     )
+
+
+def build_delete_result_xml(deleted: list[str], errors: list[tuple[str, str]]) -> bytes:
+    parts = ['<?xml version="1.0" encoding="UTF-8"?><DeleteResult>']
+    for key in deleted:
+        parts.append(f"<Deleted><Key>{_escape(key)}</Key></Deleted>")
+    for key, code in errors:
+        parts.append(
+            f"<Error><Key>{_escape(key)}</Key><Code>{_escape(code)}</Code>"
+            f"<Message>{_escape(code)}</Message></Error>"
+        )
+    parts.append("</DeleteResult>")
+    return "".join(parts).encode("utf-8")

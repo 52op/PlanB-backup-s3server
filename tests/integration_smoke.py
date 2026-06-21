@@ -242,17 +242,52 @@ def main():
         raise AssertionError("REPLACE should not keep old metadata")
     print(f"[OK] copy(REPLACE) metadata={meta_replaced}")
 
-    # 11) Delete object idempotency
+    # 11) DeleteObjects (batch delete)
+    print_step("DeleteObjects batch delete")
+    batch_keys = ["batch/a.txt", "batch/b.txt", "batch/c.txt"]
+    for bk in batch_keys:
+        client.put_object(Bucket=bucket, Key=bk, Body=b"batch-test")
+    # Verify 3 objects exist
+    list_before = client.list_objects_v2(Bucket=bucket, Prefix="batch/")
+    assert_true(
+        len(list_before.get("Contents", [])) == 3,
+        f"Expected 3 batch objects, got {len(list_before.get('Contents', []))}",
+    )
+    # Batch delete all 3
+    delete_objs = [{"Key": bk} for bk in batch_keys]
+    del_resp = client.delete_objects(Bucket=bucket, Delete={"Objects": delete_objs})
+    assert_true(
+        len(del_resp.get("Deleted", [])) == 3,
+        f"Expected 3 deleted, got {len(del_resp.get('Deleted', []))}",
+    )
+    errors = del_resp.get("Errors", [])
+    assert_true(len(errors) == 0, f"Expected 0 errors, got {len(errors)}: {errors}")
+    # Verify they're gone
+    list_after = client.list_objects_v2(Bucket=bucket, Prefix="batch/")
+    assert_true(
+        len(list_after.get("Contents", [])) == 0,
+        f"Expected 0 batch objects after delete, got {len(list_after.get('Contents', []))}",
+    )
+    # Test quiet mode with non-existent keys (idempotent)
+    del_quiet = client.delete_objects(
+        Bucket=bucket,
+        Delete={"Objects": [{"Key": "nonexistent1"}, {"Key": "nonexistent2"}], "Quiet": True},
+    )
+    assert_true(len(del_quiet.get("Deleted", [])) == 2, "Quiet mode should report deletes")
+    assert_true(len(del_quiet.get("Errors", [])) == 0, "Quiet mode should have no errors")
+    print(f"[OK] DeleteObjects batch={batch_keys} quiet=2")
+
+    # 12) Delete object idempotency
     print_step("DeleteObject idempotent")
     client.delete_object(Bucket=bucket, Key="not-exists.txt")
     client.delete_object(Bucket=bucket, Key=key)
     print("[OK] delete object calls succeeded")
 
-    # 12) Delete non-empty bucket should fail
+    # 13) Delete non-empty bucket should fail
     print_step("DeleteBucket non-empty should fail")
     expect_client_error(lambda: client.delete_bucket(Bucket=bucket), "BucketNotEmpty")
 
-    # 13) Cleanup
+    # 14) Cleanup
     print_step("Cleanup")
     # bucket
     client.delete_object(Bucket=bucket, Key=key2)
@@ -263,12 +298,12 @@ def main():
     client.delete_bucket(Bucket=bucket2)
     print("[OK] cleanup completed")
 
-    print("\n✅ Integration smoke test passed.")
+    print("\n[PASS] Integration smoke test passed.")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"\n❌ Integration smoke test failed: {e}")
+        print(f"\n[FAIL] Integration smoke test failed: {e}")
         sys.exit(1)

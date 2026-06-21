@@ -7,7 +7,10 @@ import json
 import os
 import posixpath
 import shutil
+import time
 import urllib.parse
+import uuid
+import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler
 from typing import Optional, Tuple
@@ -18,6 +21,7 @@ from .config import AppConfig
 from .logger import log
 from .responses import (
     S3_NS,
+    build_delete_result_xml,
     send_access_denied,
     send_invalid_bucket_name,
     send_invalid_uri,
@@ -291,6 +295,88 @@ def _parse_single_range_header(
     return start, end
 
 
+# ------------------------- Multipart upload helpers ------------------------- #
+
+MULTIPART_DIR = ".uploads"
+
+
+def _upload_parts_dir(data_dir: str, bucket: str, upload_id: str) -> str:
+    return os.path.join(data_dir, bucket, MULTIPART_DIR, upload_id)
+
+
+def _upload_meta_path(data_dir: str, bucket: str, upload_id: str) -> str:
+    return os.path.join(data_dir, bucket, MULTIPART_DIR, f"{upload_id}.meta")
+
+
+def _build_create_multipart_result_xml(bucket: str, key: str, upload_id: str) -> bytes:
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<CreateMultipartUploadResult>"
+        f"<Bucket>{xml_escape(bucket)}</Bucket>"
+        f"<Key>{xml_escape(key)}</Key>"
+        f"<UploadId>{xml_escape(upload_id)}</UploadId>"
+        "</CreateMultipartUploadResult>"
+    )
+    return xml.encode("utf-8")
+
+
+def _build_list_parts_result_xml(
+    bucket: str, key: str, upload_id: str, parts: list[tuple[int, str, int]],
+    max_parts: int, part_number_marker: int,
+) -> bytes:
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        "<ListPartsResult>",
+        f"<Bucket>{xml_escape(bucket)}</Bucket>",
+        f"<Key>{xml_escape(key)}</Key>",
+        f"<UploadId>{xml_escape(upload_id)}</UploadId>",
+        f"<MaxParts>{max_parts}</MaxParts>",
+        f"<PartNumberMarker>{part_number_marker}</PartNumberMarker>",
+        "<IsTruncated>false</IsTruncated>",
+    ]
+    for pnum, etag, size in parts:
+        lines.append("<Part>")
+        lines.append(f"<PartNumber>{pnum}</PartNumber>")
+        lines.append(f"<ETag>{xml_escape(etag)}</ETag>")
+        lines.append(f"<Size>{size}</Size>")
+        lines.append("</Part>")
+    lines.append("</ListPartsResult>")
+    return "".join(lines).encode("utf-8")
+
+
+def _build_list_multipart_uploads_result_xml(
+    bucket: str, uploads: list[tuple[str, str, str]],
+) -> bytes:
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        "<ListMultipartUploadsResult>",
+        f"<Bucket>{xml_escape(bucket)}</Bucket>",
+        "<IsTruncated>false</IsTruncated>",
+    ]
+    for key, upload_id, initiated in uploads:
+        lines.append("<Upload>")
+        lines.append(f"<Key>{xml_escape(key)}</Key>")
+        lines.append(f"<UploadId>{xml_escape(upload_id)}</UploadId>")
+        lines.append(f"<Initiated>{xml_escape(initiated)}</Initiated>")
+        lines.append("</Upload>")
+    lines.append("</ListMultipartUploadsResult>")
+    return "".join(lines).encode("utf-8")
+
+
+def _build_complete_multipart_result_xml(
+    bucket: str, key: str, etag: str,
+) -> bytes:
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<CompleteMultipartUploadResult>"
+        f"<Bucket>{xml_escape(bucket)}</Bucket>"
+        f"<Key>{xml_escape(key)}</Key>"
+        f"<ETag>{xml_escape(etag)}</ETag>"
+        "</CompleteMultipartUploadResult>"
+    )
+    return xml.encode("utf-8")
+
+
 class S3Handler(BaseHTTPRequestHandler):
     """
     Modular S3-like request handler.
@@ -488,9 +574,27 @@ class S3Handler(BaseHTTPRequestHandler):
             return
 
         bucket, key = self._parse_bucket_key()
-        if not bucket or not key:
+        if not bucket:
             send_s3_error(self, 404, "NotFound", "Not Found")
             self._log(f"S3 HEAD miss path={self.path}")
+            return
+
+        # HeadBucket: HEAD /{bucket} with no key
+        if not key:
+            try:
+                bucket_dir, _ = self._safe_join_bucket_key(bucket, "")
+            except ValueError:
+                send_invalid_bucket_name(self)
+                self._log(f"S3 HEAD bucket invalid bucket={bucket}")
+                return
+            if not os.path.isdir(bucket_dir):
+                send_no_such_bucket(self, bucket)
+                self._log(f"S3 HEAD bucket miss bucket={bucket}")
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            self._log(f"S3 HEAD bucket ok bucket={bucket}")
             return
 
         try:
@@ -562,6 +666,202 @@ class S3Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self._log(f"S3 HEAD hit bucket={bucket} key={key} size={size}")
 
+    # ------------------------- Multipart upload handlers ------------------------- #
+
+    def _uploads_dir(self) -> str:
+        return os.path.join(self.cfg.server.data_dir, MULTIPART_DIR)
+
+    def _upload_parts_dir(self, bucket: str, upload_id: str) -> str:
+        return os.path.join(self._uploads_dir(), bucket, upload_id)
+
+    def _upload_meta_path(self, bucket: str, upload_id: str) -> str:
+        return os.path.join(self._uploads_dir(), bucket, f"{upload_id}.meta")
+
+    def _handle_create_multipart_upload(self, bucket: str, key: str) -> None:
+        upload_id = uuid.uuid4().hex
+        meta = {
+            "key": key,
+            "upload_id": upload_id,
+            "initiated": _format_iso8601_utc(time.time()),
+        }
+        meta_dir = os.path.join(self._uploads_dir(), bucket)
+        os.makedirs(meta_dir, exist_ok=True)
+        with open(self._upload_meta_path(bucket, upload_id), "w") as f:
+            json.dump(meta, f)
+        body = _build_create_multipart_result_xml(bucket, key, upload_id)
+        send_xml_response(self, 200, body)
+        self._log(f"S3 MPU create ok bucket={bucket} key={key} uploadId={upload_id}")
+
+    def _handle_upload_part(self, bucket: str, key: str, upload_id: str, part_number: int) -> None:
+        meta_path = self._upload_meta_path(bucket, upload_id)
+        if not os.path.isfile(meta_path):
+            send_s3_error(self, 404, "NoSuchUpload", "The specified upload does not exist.")
+            self._log(f"S3 MPU upload-part no-such-upload bucket={bucket} key={key} uploadId={upload_id}")
+            return
+        part_dir = self._upload_parts_dir(bucket, upload_id)
+        os.makedirs(part_dir, exist_ok=True)
+        part_path = os.path.join(part_dir, str(part_number))
+        data = self._read_request_body()
+        with open(part_path, "wb") as f:
+            f.write(data)
+        etag = hashlib.md5(data).hexdigest()
+        self.send_response(200)
+        self.send_header("ETag", f'"{etag}"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        self._log(f"S3 MPU upload-part ok bucket={bucket} key={key} part={part_number} bytes={len(data)} uploadId={upload_id}")
+
+    def _handle_complete_multipart_upload(self, bucket: str, key: str, upload_id: str) -> None:
+        meta_path = self._upload_meta_path(bucket, upload_id)
+        if not os.path.isfile(meta_path):
+            send_s3_error(self, 404, "NoSuchUpload", "The specified upload does not exist.")
+            return
+        body = self._read_request_body()
+        if not body.strip():
+            send_s3_error(self, 400, "MalformedXML", "The XML you provided was not well-formed.")
+            return
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError:
+            send_s3_error(self, 400, "MalformedXML", "The XML you provided was not well-formed.")
+            return
+        tag = root.tag.split("}")[-1]
+        ns = {"s3": S3_NS} if "}" in root.tag else {}
+        def _find_text(parent, child_tag):
+            if ns:
+                elem = parent.find(f"s3:{child_tag}", ns)
+            else:
+                elem = parent.find(child_tag)
+            return elem.text if elem is not None and elem.text else ""
+        if tag != "CompleteMultipartUpload":
+            send_s3_error(self, 400, "MalformedXML", "Expected <CompleteMultipartUpload>.")
+            return
+        part_elems = root.findall("s3:Part", ns) if ns else root.findall("Part")
+        if not part_elems:
+            send_s3_error(self, 400, "MalformedXML", "At least one <Part> is required.")
+            return
+        parts = []
+        for pe in part_elems:
+            pn_str = _find_text(pe, "PartNumber")
+            etag_str = _find_text(pe, "ETag")
+            try:
+                pn = int(pn_str)
+            except (ValueError, TypeError):
+                continue
+            parts.append((pn, etag_str))
+        parts.sort(key=lambda x: x[0])
+        part_dir = self._upload_parts_dir(bucket, upload_id)
+        tmp_path = None
+        try:
+            _, final_path = self._safe_join_bucket_key(bucket, key)
+        except ValueError:
+            send_invalid_uri(self, "Invalid key.")
+            return
+        os.makedirs(os.path.dirname(final_path), exist_ok=True)
+        tmp_path = final_path + ".mpu_tmp"
+        try:
+            with open(tmp_path, "wb") as out:
+                for pn, _ in parts:
+                    pp = os.path.join(part_dir, str(pn))
+                    if not os.path.isfile(pp):
+                        send_s3_error(self, 400, "InvalidPart", f"Part {pn} was not uploaded.")
+                        self._cleanup_upload(meta_path, part_dir, tmp_path)
+                        return
+                    with open(pp, "rb") as f:
+                        while True:
+                            chunk = f.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+            os.replace(tmp_path, final_path)
+            tmp_path = None
+        except Exception:
+            if tmp_path and os.path.isfile(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+            raise
+        etag = _md5_file_hex(final_path)
+        self._cleanup_upload(meta_path, part_dir, None)
+        body = _build_complete_multipart_result_xml(bucket, key, f'"{etag}"')
+        self._log(f"S3 MPU complete ok bucket={bucket} key={key} parts={len(parts)} uploadId={upload_id}")
+        send_xml_response(self, 200, body)
+
+    def _cleanup_upload(self, meta_path: str, part_dir: str, tmp_path: str | None) -> None:
+        if tmp_path and os.path.isfile(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        if os.path.isdir(part_dir):
+            try:
+                shutil.rmtree(part_dir)
+            except Exception:
+                pass
+        if os.path.isfile(meta_path):
+            try:
+                os.remove(meta_path)
+            except Exception:
+                pass
+
+    def _handle_abort_multipart_upload(self, bucket: str, key: str, upload_id: str) -> None:
+        meta_path = self._upload_meta_path(bucket, upload_id)
+        if not os.path.isfile(meta_path):
+            send_s3_error(self, 404, "NoSuchUpload", "The specified upload does not exist.")
+            return
+        part_dir = self._upload_parts_dir(bucket, upload_id)
+        self._cleanup_upload(meta_path, part_dir, None)
+        self.send_response(204)
+        self.end_headers()
+        self._log(f"S3 MPU abort ok bucket={bucket} key={key} uploadId={upload_id}")
+
+    def _handle_list_parts(self, bucket: str, key: str, upload_id: str) -> None:
+        meta_path = self._upload_meta_path(bucket, upload_id)
+        if not os.path.isfile(meta_path):
+            send_s3_error(self, 404, "NoSuchUpload", "The specified upload does not exist.")
+            return
+        part_dir = self._upload_parts_dir(bucket, upload_id)
+        parts = []
+        if os.path.isdir(part_dir):
+            for fname in os.listdir(part_dir):
+                pp = os.path.join(part_dir, fname)
+                if os.path.isfile(pp):
+                    try:
+                        pn = int(fname)
+                    except ValueError:
+                        continue
+                    etag = _md5_file_hex(pp)
+                    size = os.path.getsize(pp)
+                    parts.append((pn, f'"{etag}"', size))
+        parts.sort(key=lambda x: x[0])
+        body = _build_list_parts_result_xml(
+            bucket, key, upload_id, parts, 1000, 0,
+        )
+        self._log(f"S3 MPU list-parts ok bucket={bucket} key={key} parts={len(parts)} uploadId={upload_id}")
+        send_xml_response(self, 200, body)
+
+    def _handle_list_multipart_uploads(self, bucket: str) -> None:
+        meta_dir = os.path.join(self._uploads_dir(), bucket)
+        uploads = []
+        if os.path.isdir(meta_dir):
+            for fname in os.listdir(meta_dir):
+                if fname.endswith(".meta"):
+                    mp = os.path.join(meta_dir, fname)
+                    try:
+                        with open(mp) as f:
+                            meta = json.load(f)
+                        uploads.append((
+                            meta.get("key", ""),
+                            meta.get("upload_id", ""),
+                            meta.get("initiated", ""),
+                        ))
+                    except Exception:
+                        pass
+        body = _build_list_multipart_uploads_result_xml(bucket, uploads)
+        self._log(f"S3 MPU list-uploads ok bucket={bucket} uploads={len(uploads)}")
+        send_xml_response(self, 200, body)
+
     def do_GET(self) -> None:
         self._log_request_start()
         if not self._auth_or_reject():
@@ -569,6 +869,20 @@ class S3Handler(BaseHTTPRequestHandler):
 
         parsed = urllib.parse.urlsplit(self.path)
         bucket, key = self._parse_bucket_key()
+
+        # ListParts: GET /{bucket}/{key}?uploadId=xxx
+        if bucket and key:
+            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            if "uploadId" in query:
+                self._handle_list_parts(bucket, key, query["uploadId"][0])
+                return
+
+        # ListMultipartUploads: GET /{bucket}?uploads
+        if bucket and not key:
+            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            if "uploads" in query:
+                self._handle_list_multipart_uploads(bucket)
+                return
 
         # GET object
         if bucket and key:
@@ -818,10 +1132,22 @@ class S3Handler(BaseHTTPRequestHandler):
             return
 
         bucket, key = self._parse_bucket_key()
+        parsed = urllib.parse.urlsplit(self.path)
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
 
         if not bucket:
             send_invalid_bucket_name(self, "Bucket name is required.")
             self._log("S3 PUT invalid empty bucket")
+            return
+
+        # UploadPart: PUT /{bucket}/{key}?uploadId=xxx&partNumber=N
+        if key and "uploadId" in query and "partNumber" in query:
+            try:
+                pn = int(query["partNumber"][0])
+            except (ValueError, TypeError):
+                send_s3_error(self, 400, "InvalidArgument", "partNumber must be an integer.")
+                return
+            self._handle_upload_part(bucket, key, query["uploadId"][0], pn)
             return
 
         # Create bucket
@@ -936,9 +1262,17 @@ class S3Handler(BaseHTTPRequestHandler):
             return
 
         bucket, key = self._parse_bucket_key()
+        parsed = urllib.parse.urlsplit(self.path)
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+
         if not bucket:
             send_invalid_bucket_name(self, "Bucket name is required.")
             self._log("S3 DELETE invalid empty bucket")
+            return
+
+        # AbortMultipartUpload: DELETE /{bucket}/{key}?uploadId=xxx
+        if key and "uploadId" in query:
+            self._handle_abort_multipart_upload(bucket, key, query["uploadId"][0])
             return
 
         # DELETE object
@@ -1046,14 +1380,140 @@ class S3Handler(BaseHTTPRequestHandler):
         self._log(f"S3 DELETE bucket ok bucket={bucket}")
 
     def do_POST(self) -> None:
-        """
-        Reserved for future APIs (multipart upload, policy POST, etc.).
-        """
         self._log_request_start()
         if not self._auth_or_reject():
             return
+
+        parsed = urllib.parse.urlsplit(self.path)
+        params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+
+        bucket, key = self._parse_bucket_key()
+
+        # CompleteMultipartUpload: POST /{bucket}/{key}?uploadId=xxx
+        if key and "uploadId" in params:
+            self._handle_complete_multipart_upload(bucket, key, params["uploadId"][0])
+            return
+
+        # CreateMultipartUpload: POST /{bucket}/{key}?uploads
+        if key and "uploads" in params:
+            self._handle_create_multipart_upload(bucket, key)
+            return
+
+        # RemoveObjects (batch delete): POST /{bucket}?delete
+        if "delete" in params:
+            self._handle_batch_delete(parsed.path)
+            return
+
         send_s3_error(self, 501, "NotImplemented", "POST operation is not implemented.")
         self._log(f"S3 POST not implemented path={self.path}")
+
+    def _handle_batch_delete(self, raw_path: str) -> None:
+        bucket, key = self._parse_bucket_key()
+        if not bucket:
+            send_invalid_bucket_name(self, "Bucket name is required.")
+            self._log("S3 POST batch-delete invalid empty bucket")
+            return
+
+        try:
+            body = self._read_request_body()
+        except Exception:
+            send_s3_error(self, 400, "MalformedXML", "The XML you provided was not well-formed.")
+            return
+
+        if not body.strip():
+            send_s3_error(self, 400, "MalformedXML", "The XML you provided was not well-formed.")
+            return
+
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError:
+            send_s3_error(self, 400, "MalformedXML", "The XML you provided was not well-formed.")
+            return
+
+        tag = root.tag.split("}")[-1]
+        ns = {"s3": S3_NS} if "}" in root.tag else {}
+
+        if tag != "Delete":
+            send_s3_error(self, 400, "MalformedXML", f"Expected <Delete> root element, got <{root.tag}>.")
+            return
+
+        def _find_text(parent, child_tag):
+            """Find child text with optional namespace."""
+            if ns:
+                elem = parent.find(f"s3:{child_tag}", ns)
+            else:
+                elem = parent.find(child_tag)
+            return elem.text if elem is not None and elem.text else ""
+
+        quiet = _find_text(root, "Quiet")
+        quiet_mode = quiet.strip().lower() == "true"
+
+        objects = root.findall("s3:Object", ns) if ns else root.findall("Object")
+        if not objects:
+            send_s3_error(self, 400, "MalformedXML", "At least one <Object> is required.")
+            return
+
+        if len(objects) > 1000:
+            send_s3_error(
+                self, 400, "MalformedXML",
+                "The batch delete request may not contain more than 1000 objects."
+            )
+            return
+
+        deleted_keys: list[str] = []
+        errors: list[tuple[str, str]] = []
+
+        for obj in objects:
+            key_val = _find_text(obj, "Key")
+            if not key_val:
+                errors.append(("", "InvalidArgument"))
+                continue
+            obj_key = key_val.strip()
+            if not obj_key:
+                errors.append(("", "InvalidArgument"))
+                continue
+
+            try:
+                _, fp = self._safe_join_bucket_key(bucket, obj_key)
+            except ValueError:
+                errors.append((obj_key, "InvalidArgument"))
+                continue
+
+            if not os.path.isfile(fp):
+                # S3 delete is idempotent — report as deleted even if missing
+                deleted_keys.append(obj_key)
+                continue
+
+            try:
+                os.remove(fp)
+                meta_path = _meta_sidecar_path(fp)
+                if os.path.isfile(meta_path):
+                    os.remove(meta_path)
+            except Exception:
+                errors.append((obj_key, "InternalError"))
+                continue
+
+            deleted_keys.append(obj_key)
+
+        body = build_delete_result_xml(deleted_keys, errors)
+
+        if quiet_mode:
+            quiet_body = ['<?xml version="1.0" encoding="UTF-8"?><DeleteResult>']
+            for _key in deleted_keys:
+                quiet_body.append("<Deleted></Deleted>")
+            for key, code in errors:
+                quiet_body.append(
+                    f"<Error><Key>{xml_escape(key)}</Key><Code>{xml_escape(code)}</Code>"
+                    f"<Message>{xml_escape(code)}</Message></Error>"
+                )
+            quiet_body.append("</DeleteResult>")
+            body = "".join(quiet_body).encode("utf-8")
+
+        send_xml_response(self, 200, body)
+        self._log(
+            f"S3 POST batch-delete ok bucket={bucket} "
+            f"deleted={len(deleted_keys)} errors={len(errors)}"
+        )
 
 
 def create_s3_handler(cfg: AppConfig) -> type[S3Handler]:
