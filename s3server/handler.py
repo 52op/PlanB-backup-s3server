@@ -498,19 +498,64 @@ class S3Handler(BaseHTTPRequestHandler):
 
     def _read_request_body(self) -> bytes:
         transfer_encoding = (self.headers.get("Transfer-Encoding", "") or "").lower()
-        if "chunked" in transfer_encoding:
-            return self._read_chunked_body()
+        content_length = self.headers.get("Content-Length", "")
+        self._log(f"READ_BODY te={repr(transfer_encoding)} cl={repr(content_length)}")
 
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0:
-            return b""
-        data = bytearray()
-        while len(data) < length:
-            chunk = self.rfile.read(length - len(data))
-            if not chunk:
+        if "chunked" in transfer_encoding:
+            self._log("READ_BODY using chunked decoder")
+            raw = self._read_chunked_body()
+        else:
+            length = int(content_length or "0")
+            if length <= 0:
+                return b""
+            data = bytearray()
+            while len(data) < length:
+                chunk = self.rfile.read(length - len(data))
+                if not chunk:
+                    break
+                data.extend(chunk)
+            self._log(f"READ_BODY read {len(data)} bytes (expected {length})")
+            raw = bytes(data)
+
+        decoded = self._maybe_decode_aws_chunked(raw)
+        if len(decoded) != len(raw):
+            self._log(f"READ_BODY decoded AWS chunked: {len(raw)} -> {len(decoded)} bytes")
+        return decoded
+
+    def _maybe_decode_aws_chunked(self, data: bytes) -> bytes:
+        """
+        Detect and decode AWS S3 签名 V4 chunked transfer encoding。
+        minio-go may send this format with Content-Length (not Transfer-Encoding: chunked),
+        so the raw body looks like: <hex>;chunk-signature=<sig>\\r\\n<data>\\r\\n0;...\\r\\n\\r\\n
+        """
+        if not data:
+            return data
+        try:
+            first_line_end = data.index(b"\n")
+            first_line = data[:first_line_end].decode("utf-8", errors="replace").rstrip("\r")
+            if ";chunk-signature=" not in first_line:
+                return data
+            self._log(f"READ_BODY detected AWS chunked format, first_line={first_line[:80]}")
+        except (ValueError, UnicodeDecodeError):
+            return data
+
+        result = bytearray()
+        pos = 0
+        while pos < len(data):
+            line_end = data.index(b"\n", pos)
+            line = data[pos:line_end].decode("utf-8", errors="replace").rstrip("\r")
+            pos = line_end + 1
+
+            size_str = line.split(";")[0].strip()
+            try:
+                chunk_size = int(size_str, 16)
+            except ValueError:
                 break
-            data.extend(chunk)
-        return bytes(data)
+            if chunk_size == 0:
+                break
+            result.extend(data[pos:pos + chunk_size])
+            pos += chunk_size + 2
+        return bytes(result)
 
     def _read_chunked_body(self) -> bytes:
         """
