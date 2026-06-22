@@ -498,9 +498,69 @@ class S3Handler(BaseHTTPRequestHandler):
 
     def _read_request_body(self) -> bytes:
         length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0:
-            return b""
-        return self.rfile.read(length)
+        transfer_encoding = (self.headers.get("Transfer-Encoding", "") or "").lower()
+
+        if length > 0:
+            data = bytearray()
+            while len(data) < length:
+                chunk = self.rfile.read(length - len(data))
+                if not chunk:
+                    break
+                data.extend(chunk)
+            return bytes(data)
+
+        if "chunked" in transfer_encoding:
+            return self._read_chunked_body()
+
+        return b""
+
+    def _read_chunked_body(self) -> bytes:
+        """
+        解码 AWS S3 签名 V4 分块传输编码。
+        格式: <hex-size>;chunk-signature=<sig>\r\n<data>\r\n...
+        """
+        result = bytearray()
+        while True:
+            size_line = self._read_line()
+            if not size_line:
+                break
+            # 格式: "95b;chunk-signature=xxx" 或 "0;chunk-signature=xxx"
+            size_str = size_line.split(";")[0].strip()
+            try:
+                chunk_size = int(size_str, 16)
+            except ValueError:
+                break
+            if chunk_size == 0:
+                # 读取最终的空 chunk-signature 行
+                self._read_line()
+                break
+            chunk_data = self._read_exact(chunk_size)
+            result.extend(chunk_data)
+            self._read_line()  # 消费 \r\n
+            self._read_line()  # 消费下一个 chunk-signature 行 (如果有的话, 但可能已经在下一轮读取)
+        return bytes(result)
+
+    def _read_line(self) -> str:
+        """从 rfile 读取一行 (到 \\n), 返回去除 \\r\\n 的字符串。"""
+        line = b""
+        while True:
+            b = self.rfile.read(1)
+            if not b:
+                break
+            if b == b"\n":
+                break
+            line += b
+        return line.decode("utf-8", errors="replace").rstrip("\r")
+
+    def _read_exact(self, n: int) -> bytes:
+        """精确读取 n 个字节。"""
+        data = bytearray()
+        while len(data) < n:
+            chunk = self.rfile.read(n - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+        return bytes(data)
 
     # ------------------------- Response builders ------------------------- #
 
