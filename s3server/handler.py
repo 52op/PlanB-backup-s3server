@@ -497,30 +497,30 @@ class S3Handler(BaseHTTPRequestHandler):
         return bucket_dir, target
 
     def _read_request_body(self) -> bytes:
-        length = int(self.headers.get("Content-Length", "0") or "0")
         transfer_encoding = (self.headers.get("Transfer-Encoding", "") or "").lower()
-
-        if length > 0:
-            data = bytearray()
-            while len(data) < length:
-                chunk = self.rfile.read(length - len(data))
-                if not chunk:
-                    break
-                data.extend(chunk)
-            return bytes(data)
-
         if "chunked" in transfer_encoding:
             return self._read_chunked_body()
 
-        return b""
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0:
+            return b""
+        data = bytearray()
+        while len(data) < length:
+            chunk = self.rfile.read(length - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+        return bytes(data)
 
     def _read_chunked_body(self) -> bytes:
         """
         解码 AWS S3 签名 V4 分块传输编码。
-        格式: <hex-size>;chunk-signature=<sig>\r\n<data>\r\n...
+        格式: <hex-size>;chunk-signature=<sig>\\r\\n<raw-data>\\r\\n...
+        最后一个 chunk: 0;chunk-signature=<sig>\\r\\n\\r\\n
         """
         result = bytearray()
         while True:
+            # 读取 chunk 大小行 (到 \\n)
             size_line = self._read_line()
             if not size_line:
                 break
@@ -531,13 +531,12 @@ class S3Handler(BaseHTTPRequestHandler):
             except ValueError:
                 break
             if chunk_size == 0:
-                # 读取最终的空 chunk-signature 行
-                self._read_line()
                 break
+            # 精确读取 chunk 数据 (二进制, 不能按行读)
             chunk_data = self._read_exact(chunk_size)
             result.extend(chunk_data)
-            self._read_line()  # 消费 \r\n
-            self._read_line()  # 消费下一个 chunk-signature 行 (如果有的话, 但可能已经在下一轮读取)
+            # 消费 chunk 数据后的 \\r\\n
+            self._read_exact(2)
         return bytes(result)
 
     def _read_line(self) -> str:
